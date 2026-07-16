@@ -21,7 +21,8 @@ test("server-renders the Braid protocol surface", async () => {
   assert.match(html, /<title>Braid — Borrow\. Stake\. Play\.<\/title>/i);
   assert.match(html, /Collateral is a conversation/);
   assert.match(html, /Stake the rail/i);
-  assert.match(html, /Thread the needle/i);
+  assert.match(html, /Verifiable RPS/i);
+  assert.match(html, /Outplay the agent/i);
   assert.match(html, /Pyth Entropy V2/i);
   assert.doesNotMatch(html, /Your site is taking shape|Codex is working/);
 });
