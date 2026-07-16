@@ -31,11 +31,26 @@ const stakingAbi = [
 
 const arenaAbi = [
   { type: "function", name: "entropyFee", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "riskRoll", stateMutability: "payable", inputs: [{ name: "guessedHigh", type: "bool" }], outputs: [{ type: "uint64" }] },
+  { type: "function", name: "playRps", stateMutability: "payable", inputs: [{ name: "playerMove", type: "uint8" }], outputs: [{ type: "uint64" }] },
   { type: "function", name: "enterRaffle", stateMutability: "nonpayable", inputs: [{ name: "extraEntries", type: "uint8" }], outputs: [] },
 ] as const;
 
-type Action = "stake" | "high" | "low" | "raffle";
+type RpsAction = "rock" | "paper" | "scissors";
+type Action = "stake" | RpsAction | "raffle";
+type MatchResult = "WIN" | "DRAW" | "LOSS";
+
+const rpsMoves: Record<RpsAction, { index: 0 | 1 | 2; label: string; glyph: string }> = {
+  rock: { index: 0, label: "ROCK", glyph: "●" },
+  paper: { index: 1, label: "PAPER", glyph: "▱" },
+  scissors: { index: 2, label: "SCISSORS", glyph: "✕" },
+};
+
+const tutorialSteps = [
+  { key: "capital", time: "00:00", eyebrow: "CAPITAL RAIL", title: "Start with a real need.", copy: "Borrow against an NFT or memecoin position, or fund the exact terms as a lender. No floor-price oracle decides the loan." },
+  { key: "move", time: "00:14", eyebrow: "LOCK THE MOVE", title: "Choose before randomness exists.", copy: "A human or agent wallet locks Rock, Paper, or Scissors on Monad. Braid cannot change the move after submission." },
+  { key: "entropy", time: "00:29", eyebrow: "VERIFIABLE RESOLUTION", title: "Pyth reveals the counter-move.", copy: "Entropy V2 returns after two blocks. The arena contract resolves the match and records points, streaks, and the proof sequence." },
+  { key: "loop", time: "00:44", eyebrow: "BRAID THE ACTIVITY", title: "One action feeds the next.", copy: "Loan interest rewards MON stakers. Arena points buy extra raffle entries. The winner receives an onchain SVG proof badge." },
+] as const;
 
 const offers = [
   {
@@ -75,7 +90,10 @@ export default function Home() {
   const [activeOffer, setActiveOffer] = useState<(typeof offers)[number]>();
   const [stakeAmount, setStakeAmount] = useState("0.10");
   const [demoPoints, setDemoPoints] = useState(40);
-  const [lastRoll, setLastRoll] = useState<number>();
+  const [lastMatch, setLastMatch] = useState<{ player: RpsAction; opponent: RpsAction; result: MatchResult }>();
+  const [demoRecord, setDemoRecord] = useState({ wins: 0, draws: 0, losses: 0, streak: 0 });
+  const [tutorialStep, setTutorialStep] = useState(0);
+  const [tutorialPlaying, setTutorialPlaying] = useState(true);
 
   const publicClient = useMemo(
     () => createPublicClient({ chain: monadTestnet, transport: http("https://testnet-rpc.monad.xyz") }),
@@ -101,6 +119,14 @@ export default function Home() {
       document.body.classList.remove("motion-ready");
     };
   }, []);
+
+  useEffect(() => {
+    if (!tutorialPlaying) return;
+    const timer = window.setInterval(() => {
+      setTutorialStep((step) => (step + 1) % tutorialSteps.length);
+    }, 4200);
+    return () => window.clearInterval(timer);
+  }, [tutorialPlaying]);
 
   const connect = useCallback(async () => {
     if (!window.ethereum) {
@@ -130,19 +156,32 @@ export default function Home() {
 
   const rehearse = useCallback(async (action: Action) => {
     await new Promise((resolve) => setTimeout(resolve, 650));
-    if (action === "high" || action === "low") {
-      const roll = Math.floor(Math.random() * 100) + 1;
-      const won = action === "high" ? roll >= 60 : roll <= 40;
-      setLastRoll(roll);
-      setDemoPoints((value) => value + (won ? 25 : 5));
-      setToast(`Rehearsal roll: ${roll}. ${won ? "+25" : "+5"} demo points. Onchain draws use Pyth Entropy.`);
+    if (action === "rock" || action === "paper" || action === "scissors") {
+      const random = crypto.getRandomValues(new Uint32Array(1))[0];
+      const opponent = (Object.keys(rpsMoves) as RpsAction[])[random % 3];
+      const playerIndex = rpsMoves[action].index;
+      const opponentIndex = rpsMoves[opponent].index;
+      const result: MatchResult = playerIndex === opponentIndex
+        ? "DRAW"
+        : (playerIndex + 1) % 3 === opponentIndex ? "LOSS" : "WIN";
+      const nextStreak = result === "WIN" ? demoRecord.streak + 1 : result === "LOSS" ? 0 : demoRecord.streak;
+      const award = result === "WIN" ? 25 + Math.min(nextStreak, 5) * 5 : result === "DRAW" ? 12 : 3;
+      setLastMatch({ player: action, opponent, result });
+      setDemoRecord((record) => ({
+        wins: record.wins + (result === "WIN" ? 1 : 0),
+        draws: record.draws + (result === "DRAW" ? 1 : 0),
+        losses: record.losses + (result === "LOSS" ? 1 : 0),
+        streak: nextStreak,
+      }));
+      setDemoPoints((value) => value + award);
+      setToast(`${result}: ${rpsMoves[action].label} vs ${rpsMoves[opponent].label}. +${award} demo points. Testnet matches use Pyth Entropy.`);
     } else if (action === "raffle") {
       setDemoPoints((value) => Math.max(0, value - 25));
       setToast("Rehearsal entry added. Contract addresses are required for an onchain entry.");
     } else {
       setToast(`Rehearsal stake: ${stakeAmount} MON. No wallet transaction was submitted.`);
     }
-  }, [stakeAmount]);
+  }, [demoRecord.streak, stakeAmount]);
 
   const execute = useCallback(async (action: Action) => {
     setBusy(action);
@@ -157,18 +196,35 @@ export default function Home() {
       const wallet = createWalletClient({ account: activeAccount, chain: monadTestnet, transport: custom(window.ethereum) });
       let hash: Address;
       if (action === "stake") {
+        const value = parseEther(stakeAmount);
+        const estimate = await publicClient.estimateContractGas({
+          account: activeAccount,
+          address: STAKING_ADDRESS as Address,
+          abi: stakingAbi,
+          functionName: "stake",
+          value,
+        });
         hash = await wallet.writeContract({
           address: STAKING_ADDRESS as Address,
           abi: stakingAbi,
           functionName: "stake",
-          value: parseEther(stakeAmount),
+          value,
+          gas: estimate + estimate / 10n,
         });
       } else if (action === "raffle") {
+        const estimate = await publicClient.estimateContractGas({
+          account: activeAccount,
+          address: ARENA_ADDRESS as Address,
+          abi: arenaAbi,
+          functionName: "enterRaffle",
+          args: [0],
+        });
         hash = await wallet.writeContract({
           address: ARENA_ADDRESS as Address,
           abi: arenaAbi,
           functionName: "enterRaffle",
           args: [0],
+          gas: estimate + estimate / 10n,
         });
       } else {
         const fee = await publicClient.readContract({
@@ -176,17 +232,29 @@ export default function Home() {
           abi: arenaAbi,
           functionName: "entropyFee",
         });
+        const move = rpsMoves[action].index;
+        const estimate = await publicClient.estimateContractGas({
+          account: activeAccount,
+          address: ARENA_ADDRESS as Address,
+          abi: arenaAbi,
+          functionName: "playRps",
+          args: [move],
+          value: fee,
+        });
         hash = await wallet.writeContract({
           address: ARENA_ADDRESS as Address,
           abi: arenaAbi,
-          functionName: "riskRoll",
-          args: [action === "high"],
+          functionName: "playRps",
+          args: [move],
           value: fee,
+          gas: estimate + estimate / 10n,
         });
-        setToast(`Entropy request submitted with ${formatEther(fee)} MON.`);
+        setToast(`${rpsMoves[action].label} locked. Pyth request submitted with ${formatEther(fee)} MON.`);
       }
       await publicClient.waitForTransactionReceipt({ hash });
-      setToast(`Confirmed on Monad Testnet · ${shortAddress(hash)}`);
+      setToast(action === "rock" || action === "paper" || action === "scissors"
+        ? `Move confirmed · Pyth resolves after 2 blocks · ${shortAddress(hash)}`
+        : `Confirmed on Monad Testnet · ${shortAddress(hash)}`);
     } catch (error) {
       setToast(error instanceof Error ? error.message.split("\n")[0] : "Transaction failed.");
     } finally {
@@ -202,6 +270,7 @@ export default function Home() {
           <span>BRAID</span>
         </a>
         <nav aria-label="Primary navigation">
+          <a href="#tutorial">Tour</a>
           <a href="#market">Market</a>
           <a href="#stake">Stake</a>
           <a href="#arena">Arena</a>
@@ -269,6 +338,50 @@ export default function Home() {
         </div>
       </section>
 
+      <section className="tutorial-section" id="tutorial">
+        <div className="tutorial-heading" data-reveal>
+          <span className="kicker">00 / INTERACTIVE FIELD GUIDE</span>
+          <h2>Understand Braid<br /><em>in sixty seconds.</em></h2>
+          <p>Press play or choose a chapter. Every scene maps to an actual contract action—not a fictional dashboard metric.</p>
+        </div>
+        <div className="tutorial-player" data-reveal data-delay="1">
+          <div className="tutorial-video" aria-live="polite">
+            <div className="video-chrome"><span>PRODUCT FILM / MONAD TESTNET</span><span>CHAPTER {String(tutorialStep + 1).padStart(2, "0")}</span></div>
+            <div className={`tutorial-scene scene-${tutorialSteps[tutorialStep].key}`}>
+              <div className="scene-grid" aria-hidden="true" />
+              <div className="scene-capital" aria-hidden="true"><i /><i /><i /></div>
+              <div className="scene-wallet" aria-hidden="true">YOU</div>
+              <div className="scene-agent" aria-hidden="true">AI</div>
+              <div className="scene-proof" aria-hidden="true"><b>PYTH</b><span>VERIFIED</span></div>
+              <div className="scene-badge" aria-hidden="true"><i /><i /><b>01</b></div>
+              <div className="scene-caption">
+                <span>{tutorialSteps[tutorialStep].eyebrow}</span>
+                <h3>{tutorialSteps[tutorialStep].title}</h3>
+                <p>{tutorialSteps[tutorialStep].copy}</p>
+              </div>
+            </div>
+            <div className="video-controls">
+              <button className="play-control" onClick={() => setTutorialPlaying((playing) => !playing)} aria-label={tutorialPlaying ? "Pause tutorial" : "Play tutorial"}>{tutorialPlaying ? "Ⅱ" : "▶"}</button>
+              <div className="video-timeline" aria-label="Tutorial progress">
+                {tutorialSteps.map((step, index) => <button key={step.key} className={index === tutorialStep ? "active" : ""} onClick={() => { setTutorialStep(index); setTutorialPlaying(false); }} aria-label={`Open chapter ${index + 1}: ${step.title}`}><i /></button>)}
+              </div>
+              <span>{tutorialSteps[tutorialStep].time} / 00:58</span>
+            </div>
+          </div>
+          <ol className="tutorial-chapters">
+            {tutorialSteps.map((step, index) => (
+              <li key={step.key} className={index === tutorialStep ? "active" : ""}>
+                <button onClick={() => { setTutorialStep(index); setTutorialPlaying(false); }}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <div><small>{step.time}</small><strong>{step.title}</strong></div>
+                  <b>↗</b>
+                </button>
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+
       <section className="market-section" id="market">
         <div className="section-heading" data-reveal>
           <div><span className="kicker">01 / CREDIT MARKET</span><h2>Collateral is a conversation.</h2></div>
@@ -329,22 +442,37 @@ export default function Home() {
 
       <section className="arena-section" id="arena">
         <div className="section-heading light" data-reveal>
-          <div><span className="kicker">03 / BRAID ARENA</span><h2>Risk, without the rigging.</h2></div>
-          <p>Guess the entropy roll. Win points. Spend them on extra raffle entries. Nothing here has monetary value.</p>
+          <div><span className="kicker">03 / BRAID ARENA</span><h2>Outplay the agent.<br />Not the odds.</h2></div>
+          <p>Lock Rock, Paper, or Scissors. Pyth reveals the arena move afterward, so neither Braid nor an AI agent can rig the match.</p>
         </div>
         <div className="arena-grid">
           <article className="game-card" data-reveal>
-            <div className="game-top"><span>THREAD THE NEEDLE</span><span>ROUND 001</span></div>
-            <div className="dial">
-              <span className="dial-value">{lastRoll ?? "?"}</span>
-              <span className="dial-caption">PYTH ROLL / 1—100</span>
-              <i className="needle" style={{ transform: `rotate(${lastRoll ? (lastRoll / 100) * 240 - 120 : 0}deg)` }} />
+            <div className="game-top"><span>VERIFIABLE RPS</span><span>{contractsLive ? "PYTH LIVE" : "REHEARSAL"}</span></div>
+            <div className="rps-stage">
+              <div className="rps-fighter player-fighter">
+                <small>YOU / WALLET</small>
+                <b>{lastMatch ? rpsMoves[lastMatch.player].glyph : "?"}</b>
+                <span>{lastMatch ? rpsMoves[lastMatch.player].label : "LOCK MOVE"}</span>
+              </div>
+              <div className={`rps-result ${lastMatch ? lastMatch.result.toLowerCase() : ""}`}>
+                <i>VS</i>
+                <strong>{lastMatch?.result ?? "READY"}</strong>
+                <small>PYTH ENTROPY V2</small>
+              </div>
+              <div className="rps-fighter agent-fighter">
+                <small>ARENA / AGENT</small>
+                <b>{lastMatch ? rpsMoves[lastMatch.opponent].glyph : "✣"}</b>
+                <span>{lastMatch ? rpsMoves[lastMatch.opponent].label : "HIDDEN"}</span>
+              </div>
             </div>
-            <p>Choose LOW (1–40) or HIGH (60–100). The middle pays consolation points. Pyth calls the result back onchain.</p>
+            <div className="rps-record"><span><small>WINS</small>{demoRecord.wins}</span><span><small>DRAWS</small>{demoRecord.draws}</span><span><small>LOSSES</small>{demoRecord.losses}</span><span><small>STREAK</small>{demoRecord.streak}</span></div>
+            <p>Your move is stored before the counter-move exists. Win streaks multiply points; points buy extra proof-badge raffle entries.</p>
             <div className="choice-row">
-              <button disabled={!!busy} onClick={() => execute("low")}><span>LOW</span>01—40</button>
-              <button disabled={!!busy} onClick={() => execute("high")}><span>HIGH</span>60—100</button>
+              {(Object.entries(rpsMoves) as [RpsAction, (typeof rpsMoves)[RpsAction]][]).map(([move, meta]) => (
+                <button key={move} disabled={!!busy} onClick={() => execute(move)}><i>{meta.glyph}</i><span>{meta.label}</span></button>
+              ))}
             </div>
+            <div className="proof-rail"><span><b>01</b> MOVE LOCKED</span><span><b>02</b> PYTH REVEALS</span><span><b>03</b> CONTRACT SCORES</span></div>
           </article>
           <article className="raffle-card" data-reveal data-delay="1">
             <span className="raffle-kicker">PROOF BADGE RAFFLE</span>
@@ -364,7 +492,7 @@ export default function Home() {
           <li><span>01</span><div><h3>Lenders publish terms</h3><p>Principal is funded up front. Offers can target an NFT ID or exact ERC-20 amount.</p></div></li>
           <li><span>02</span><div><h3>Humans or agents accept</h3><p>Collateral enters escrow; MON reaches the borrower in the same transaction.</p></div></li>
           <li><span>03</span><div><h3>Repayment feeds stakers</h3><p>The lender receives principal plus interest, less a transparent share of interest.</p></div></li>
-          <li><span>04</span><div><h3>Activity becomes play</h3><p>Pyth Entropy produces verifiable game rolls and raffle winners for no-value badges.</p></div></li>
+          <li><span>04</span><div><h3>Agents play by human rules</h3><p>Any wallet can enter RPS, but Pyth produces the counter-move after the player move is locked. The same entropy rail draws badge winners.</p></div></li>
         </ol>
       </section>
 
