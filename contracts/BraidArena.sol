@@ -10,12 +10,21 @@ import {IEntropyConsumer} from "@pythnetwork/entropy-sdk-solidity/IEntropyConsum
 import {IEntropyV2} from "@pythnetwork/entropy-sdk-solidity/IEntropyV2.sol";
 
 /// @title BraidArena
-/// @notice No-value testnet game and raffle using Pyth Entropy V2 callbacks.
+/// @notice No-value testnet RPS arena and raffle using Pyth Entropy V2 callbacks.
 contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
     using Strings for uint256;
 
-    enum RequestKind { None, RiskRoll, RaffleDraw }
-    struct GameRequest { address player; bool guessedHigh; }
+    enum RequestKind { None, RpsMatch, RaffleDraw }
+    enum Move { Rock, Paper, Scissors }
+    enum Result { Loss, Draw, Win }
+    struct RpsRequest { address player; Move playerMove; }
+    struct RpsStats {
+        uint32 wins;
+        uint32 draws;
+        uint32 losses;
+        uint32 currentStreak;
+        uint32 bestStreak;
+    }
 
     IEntropyV2 public immutable entropy;
     uint256 public roundId = 1;
@@ -26,11 +35,20 @@ contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
     mapping(uint256 => mapping(address => bool)) public enteredFree;
     mapping(uint256 => address) public winner;
     mapping(uint64 => RequestKind) public requestKind;
-    mapping(uint64 => GameRequest) public gameRequests;
+    mapping(uint64 => RpsRequest) public rpsRequests;
+    mapping(address => RpsStats) public rpsStats;
     mapping(uint64 => uint256) public drawRequests;
 
-    event RiskRequested(uint64 indexed sequence, address indexed player, bool guessedHigh);
-    event RiskSettled(uint64 indexed sequence, address indexed player, uint8 roll, bool won, uint256 pointsAwarded);
+    event RpsRequested(uint64 indexed sequence, address indexed player, Move playerMove);
+    event RpsSettled(
+        uint64 indexed sequence,
+        address indexed player,
+        Move playerMove,
+        Move opponentMove,
+        Result result,
+        uint256 pointsAwarded,
+        uint32 streak
+    );
     event RaffleEntered(uint256 indexed roundId, address indexed player, uint8 entries);
     event DrawRequested(uint64 indexed sequence, uint256 indexed roundId);
     event WinnerDrawn(uint256 indexed roundId, address indexed winner, uint256 badgeId);
@@ -52,14 +70,16 @@ contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
         return entropy.getFeeV2();
     }
 
-    function riskRoll(bool guessedHigh) external payable nonReentrant returns (uint64 sequence) {
+    /// @notice Locks the player's move before Pyth generates the arena move.
+    /// @dev Any EOA or smart-account agent can play under the same rules.
+    function playRps(Move playerMove) external payable nonReentrant returns (uint64 sequence) {
         uint256 fee = entropy.getFeeV2();
         if (msg.value < fee) revert InsufficientFee();
         sequence = entropy.requestV2{value: fee}();
-        requestKind[sequence] = RequestKind.RiskRoll;
-        gameRequests[sequence] = GameRequest(msg.sender, guessedHigh);
+        requestKind[sequence] = RequestKind.RpsMatch;
+        rpsRequests[sequence] = RpsRequest(msg.sender, playerMove);
         if (msg.value > fee) _refund(msg.sender, msg.value - fee);
-        emit RiskRequested(sequence, msg.sender, guessedHigh);
+        emit RpsRequested(sequence, msg.sender, playerMove);
     }
 
     function enterRaffle(uint8 extraEntries) external {
@@ -101,14 +121,37 @@ contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
     function entropyCallback(uint64 sequence, address, bytes32 randomNumber) internal override {
         RequestKind kind = requestKind[sequence];
         requestKind[sequence] = RequestKind.None;
-        if (kind == RequestKind.RiskRoll) {
-            GameRequest memory request = gameRequests[sequence];
-            delete gameRequests[sequence];
-            uint8 roll = uint8(uint256(randomNumber) % 100) + 1;
-            bool won = request.guessedHigh ? roll >= 60 : roll <= 40;
-            uint256 award = won ? 25 : 5;
+        if (kind == RequestKind.RpsMatch) {
+            RpsRequest memory request = rpsRequests[sequence];
+            delete rpsRequests[sequence];
+            Move opponentMove = Move(uint8(uint256(randomNumber) % 3));
+            Result result = _result(request.playerMove, opponentMove);
+            RpsStats storage stats = rpsStats[request.player];
+            uint256 award;
+            if (result == Result.Win) {
+                stats.wins += 1;
+                stats.currentStreak += 1;
+                if (stats.currentStreak > stats.bestStreak) stats.bestStreak = stats.currentStreak;
+                uint32 streakBonus = stats.currentStreak > 5 ? 5 : stats.currentStreak;
+                award = 25 + uint256(streakBonus) * 5;
+            } else if (result == Result.Draw) {
+                stats.draws += 1;
+                award = 12;
+            } else {
+                stats.losses += 1;
+                stats.currentStreak = 0;
+                award = 3;
+            }
             points[request.player] += award;
-            emit RiskSettled(sequence, request.player, roll, won, award);
+            emit RpsSettled(
+                sequence,
+                request.player,
+                request.playerMove,
+                opponentMove,
+                result,
+                award,
+                stats.currentStreak
+            );
             return;
         }
         if (kind == RequestKind.RaffleDraw) {
@@ -135,7 +178,7 @@ contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
         );
         string memory json = string.concat(
             '{"name":"Braid Proof Badge #', tokenId.toString(),
-            '","description":"A no-value testnet badge drawn with Pyth Entropy on Monad.","image":"data:image/svg+xml;base64,',
+            '","description":"A no-value testnet badge earned through verifiable RPS and drawn with Pyth Entropy on Monad.","image":"data:image/svg+xml;base64,',
             Base64.encode(bytes(svg)), '"}'
         );
         return string.concat("data:application/json;base64,", Base64.encode(bytes(json)));
@@ -144,5 +187,15 @@ contract BraidArena is ERC721, Ownable, ReentrancyGuard, IEntropyConsumer {
     function _refund(address to, uint256 amount) internal {
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert InvalidAction();
+    }
+
+    function _result(Move playerMove, Move opponentMove) private pure returns (Result) {
+        if (playerMove == opponentMove) return Result.Draw;
+        if (
+            (playerMove == Move.Rock && opponentMove == Move.Scissors)
+                || (playerMove == Move.Paper && opponentMove == Move.Rock)
+                || (playerMove == Move.Scissors && opponentMove == Move.Paper)
+        ) return Result.Win;
+        return Result.Loss;
     }
 }
